@@ -175,6 +175,8 @@ class SACAgent(BaseAlgorithm):
         os.makedirs(self.nn_dir, exist_ok=True)
         os.makedirs(self.summaries_dir, exist_ok=True)
 
+        self.algo_observer = config['features']['observer']
+        self.algo_observer.before_init(base_name, config, self.experiment_name)
         self.writer = SummaryWriter('runs/' + config['name'] + datetime.now().strftime("_%d-%H-%M-%S"))
         print("Run Directory:", config['name'] + datetime.now().strftime("_%d-%H-%M-%S"))
 
