@@ -14,7 +14,7 @@ from torch import optim
 import torch
 import torch.nn as nn
 
-from rl_games.common.a2c_common import A2CBase, print_statistics
+from rl_games.common.a2c_common import A2CBase, print_statistics, swap_and_flatten01
 import torch.distributed as dist
 
 
@@ -49,15 +49,27 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.model.to(self.ppo_device)
 
         self.predictor_target = nn.Sequential(
+            nn.LazyLinear(1024),
+            nn.ReLU(),
+            nn.LazyLinear(512),
+            nn.ReLU(),
+            nn.LazyLinear(256),
+            nn.ReLU(),
             nn.LazyLinear(128),
             nn.ReLU(),
-            nn.LazyLinear(1)
+            nn.LazyLinear(64)
         ).to(self.ppo_device)
 
         self.predictor = nn.Sequential(
+            nn.LazyLinear(1024),
+            nn.ReLU(),
+            nn.LazyLinear(512),
+            nn.ReLU(),
+            nn.LazyLinear(256),
+            nn.ReLU(),
             nn.LazyLinear(128),
             nn.ReLU(),
-            nn.LazyLinear(1)
+            nn.LazyLinear(64)
         ).to(self.ppo_device)
 
         self.predictor_initialized = False
@@ -188,13 +200,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
-            e_loss = (self.predictor(obs_batch) - self.predictor_target(obs_batch))**2
-            predictor_loss = ((self.predictor(obs_batch) - self.predictor_target(obs_batch))**2).mean()
-
-            if not self.predictor_initialized:
-                for param in self.predictor_target.parameters():
-                    param.requires_grad = False
-                self.predictor_initialized = True
+            with torch.no_grad():
+                prediction_target = self.predictor_target(obs_batch)
+            e_loss = ((self.predictor(obs_batch) - prediction_target)**2)
+            predictor_loss = ((self.predictor(obs_batch) - prediction_target)**2).mean()
 
             if self.has_value_loss:
                 c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
@@ -209,7 +218,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1), e_loss], rnn_masks)
             a_loss, c_loss, entropy, b_loss, e_loss = losses[0], losses[1], losses[2], losses[3], losses[4]
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef - e_loss * self.exploration_bonus_coef
+            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             aux_loss = self.model.get_aux_loss()
             self.aux_loss_dict = {}
             if aux_loss is not None:
@@ -269,6 +278,77 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         else:
             b_loss = 0
         return b_loss
+
+    def play_steps(self):
+        update_list = self.update_list
+
+        step_time = 0.0
+
+        for n in range(self.horizon_length):
+            if self.use_action_masks:
+                masks = self.vec_env.get_action_masks()
+                res_dict = self.get_masked_action_values(self.obs, masks)
+            else:
+                res_dict = self.get_action_values(self.obs)
+            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            self.experience_buffer.update_data('dones', n, self.dones)
+
+            for k in update_list:
+                self.experience_buffer.update_data(k, n, res_dict[k])
+            if self.has_central_value:
+                self.experience_buffer.update_data('states', n, self.obs['states'])
+
+            step_time_start = time.perf_counter()
+            self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
+            with torch.no_grad():
+                prediction_target = self.predictor_target(self.obs['obs'])
+            expl_reward = ((self.predictor(self.obs['obs']) - prediction_target) ** 2).mean(dim=-1).detach()
+            # rewards = rewards + expl_reward[:, None] * self.exploration_bonus_coef
+            rewards = expl_reward[:, None] * self.exploration_bonus_coef
+            step_time_end = time.perf_counter()
+
+            step_time += (step_time_end - step_time_start)
+
+            shaped_rewards = self.rewards_shaper(rewards)
+            if self.value_bootstrap and 'time_outs' in infos:
+                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(
+                    1).float()
+
+            self.experience_buffer.update_data('rewards', n, shaped_rewards)
+
+            self.current_rewards += rewards
+            self.current_shaped_rewards += shaped_rewards
+            self.current_lengths += 1
+
+            all_done_indices = self.dones.nonzero(as_tuple=False)
+            env_done_indices = all_done_indices[::self.num_agents]
+
+            self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
+            self.game_lengths.update(self.current_lengths[env_done_indices])
+            self.algo_observer.process_infos(infos, env_done_indices)
+
+            not_dones = 1.0 - self.dones.float()
+
+            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
+            self.current_lengths = self.current_lengths * not_dones
+
+        last_values = self.get_values(self.obs)
+
+        fdones = self.dones.float()
+        mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
+        mb_values = self.experience_buffer.tensor_dict['values']
+        mb_rewards = self.experience_buffer.tensor_dict['rewards']
+        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
+        mb_returns = mb_advs + mb_values
+
+        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
+        batch_dict['returns'] = swap_and_flatten01(mb_returns)
+        batch_dict['played_frames'] = self.batch_size
+        batch_dict['step_time'] = step_time
+
+        return batch_dict
 
     def train_epoch(self):
         A2CBase.train_epoch(self)
